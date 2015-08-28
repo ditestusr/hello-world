@@ -1,1 +1,1304 @@
-ds;al'dfka;jdfl;sajd;lsjalkdjfkjdslf
+package com.restaurant.integration.api.impl;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.UnsupportedEncodingException;
+import java.math.BigDecimal;
+import java.rmi.RemoteException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+
+import javax.xml.rpc.ServiceException;
+
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.client.DefaultHttpClient;
+import org.apache.http.params.BasicHttpParams;
+import org.apache.http.params.HttpConnectionParams;
+import org.apache.http.params.HttpParams;
+import org.apache.http.protocol.HTTP;
+import org.apache.log4j.Logger;
+
+import com.restaurant.common.CMSErrors;
+import com.restaurant.integration.api.POSMenuItemInfo;
+import com.restaurant.integration.api.POSModifierValueInfo;
+import com.restaurant.integration.api.RestaurantIntegrationAPI;
+import com.restaurant.integration.api.RestaurantIntegrationAPIException;
+import com.restaurant.integration.api.RestaurantIntegrationFactory.TYPE;
+import com.restaurant.integration.util.ParseXMLDOM;
+import com.titbit.integration.micros9700.CalculateTotalsResponse;
+import com.titbit.integration.micros9700.GetOpenCheckSLUListRequest;
+import com.titbit.integration.micros9700.GetOpenCheckSLUListResponse;
+import com.titbit.integration.micros9700.OpenCheckSLUEntry;
+import com.titbit.integration.micros9700.RequestHeader;
+import com.titbit.integration.micros9700.TransactionServices6Locator;
+import com.titbit.integration.micros9700.dataaccess.GetMenuItemsRequest;
+import com.titbit.integration.micros9700.dataaccess.GetMenuItemsResponse;
+import com.titbit.integration.micros9700.dataaccess.GetOutOfMenuItemsRequest;
+import com.titbit.integration.micros9700.dataaccess.GetOutOfMenuItemsResponse;
+import com.titbit.integration.micros9700.dataaccess.MenuItemDefinition;
+import com.titbit.integration.micros9700.dataaccess.MenuItemPrice;
+import com.titbit.integration.micros9700.dataaccess.MicrosExportPosAPILocator;
+import com.titbit.integration.micros9700.dataaccess.MicrosExportPosAPISoap_PortType;
+
+public class Micros9700IntegrationImpl implements RestaurantIntegrationAPI {
+
+	private static final Logger log = Logger.getLogger(Micros9700IntegrationImpl.class);
+	
+	static private MicrosExportPosAPILocator serviceLocatorDownloads;
+	
+	private String clientIdForThis = null;
+	private List<Integer> supportedResturants = null;
+	
+	public Micros9700IntegrationImpl(){
+		supportedResturants = new ArrayList();
+	}
+	
+	public String verifyPOSCheck(String checkID, int restaurantRef) throws RestaurantIntegrationAPIException {
+		Object posId = callMicros9700Remote("", "verifyTab", checkID, restaurantRef);
+		String posIdStr = posId.toString();
+		return posIdStr;
+	}
+	
+	@Override
+	public long startTransaction(String empID, String tableID, long custID, int guests, int restaurantRef, Object ... otherInfo) throws RestaurantIntegrationAPIException {
+	
+		long tableStatus = (Long)callMicros9700Remote("", "startTxn", tableID, restaurantRef);
+
+		Boolean postOrdAtStartTxnBool = getPostOrderAtStartTxn(restaurantRef);//check setting
+		
+		if(postOrdAtStartTxnBool && tableStatus == CMSErrors.SUCCESS){
+			//callPostTransaction to 9700 with dummy item to open check at titbit's start transaction
+			
+			StringBuilder dummyOrderXML = new StringBuilder("<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+					+ "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" "
+					+ "xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body>"
+					+ "<PostTransaction xmlns=\"http://www.micros.com/pos/les/TransactionServices\">"
+					+ "<REQ><RequestHeader>"
+					+ "<InterfaceVersion>"+getInterfaceVersion(restaurantRef)+"</InterfaceVersion>"
+					+ "<ClientName>"+getClientIdForThis()+"</ClientName>"
+					+ "</RequestHeader><CheckDetailEntries>"
+					+ "<MenuItem><ReferenceEntry xsi:nil=\"true\" /><Count>1</Count><Price>0</Price>"
+					+ "<ItemNumber>"+getDummyItemPOSID(restaurantRef)+"</ItemNumber><PriceLevel>1</PriceLevel>"
+					+ "<Seat>1</Seat></MenuItem>"
+					+ "</CheckDetailEntries><CheckHeaderRequest>");
+			
+			String checkIdConstructed = "";
+			SimpleDateFormat dateFormat = new SimpleDateFormat("ddHHmmss");
+			String currentTimeStamp = dateFormat.format(new Date());
+			
+			if(tableID != null && !"".equals(tableID.trim())){//line busting order - if it has table info
+				
+				checkIdConstructed = otherInfo[0].toString() + "@" + currentTimeStamp;
+				dummyOrderXML.append("<CheckId>"+ checkIdConstructed + "</CheckId>");
+			}
+			
+			dummyOrderXML.append("<GuestInformation><ID /><FirstName /><LastName /><Address1 /><Address2 /><Address3 /><PhoneNum /><UserText1 /><UserText2 /><UserText3 />"
+					+ "<GUID /></GuestInformation><CheckEmployeeNumber>"+empID+"</CheckEmployeeNumber></CheckHeaderRequest>"
+					+ "<OrderTypeNumber>"+getMicros9700OrderType(restaurantRef)+"</OrderTypeNumber>"
+					+ "</REQ></PostTransaction></soap:Body></soap:Envelope>");
+
+			log.debug("postTransaction request XML while startTransaction in Titbit : "+dummyOrderXML);
+			
+			String resXML = (String)callMicros9700Remote(dummyOrderXML.toString(), "PostTransaction", tableID, restaurantRef);
+			
+			String checkNum = "";
+			String checkGuid = "";
+			String checkIdResponse = "";
+			Integer checkSeq = CMSErrors.FAILURE;
+			
+			if(resXML != null && !"".equals(resXML.trim())){
+				ParseXMLDOM parseXMLDOM = new ParseXMLDOM();
+				String successStatus = parseXMLDOM.parseDOMForTag(resXML, "Success");
+				
+				if(successStatus != null && successStatus.trim().equalsIgnoreCase("true")){
+					checkNum = parseXMLDOM.parseDOMForTag(resXML, "CheckNumber");
+					checkGuid = parseXMLDOM.parseDOMForTag(resXML, "CheckGuid");
+					checkIdResponse = parseXMLDOM.parseDOMForTag(resXML, "CheckID");
+					
+					if(checkIdResponse == null || "".equals(checkIdResponse.trim())){
+						checkIdResponse = checkIdConstructed;
+					}
+					
+					String compositePosKOTId =checkNum + "|" + checkIdResponse + "|" + checkGuid;
+					otherInfo[0] = compositePosKOTId;
+					
+					checkSeq = CMSErrors.SUCCESS; 
+				}
+				else if(successStatus.trim().equalsIgnoreCase("false")){
+					boolean isError = parseXMLDOM.parseDOMErrorsMicros9700(resXML);
+					
+					if(isError){
+						String errorMsg = parseXMLDOM.parseDOMErrorTextMicros9700(resXML);
+						log.debug("Error at POS in postTransaction while titbit startTransaction:: " + errorMsg);
+					}
+					else{
+						log.debug("postTransaction while titbit startTransaction failed but no error message from micros 9700");
+					}
+					checkSeq = CMSErrors.ERR_MICROS9700_ERROR_AT_POS;
+				}
+				else{
+					checkSeq = CMSErrors.ERR_MICROS9700_ERROR_AT_POS;
+				}
+			}
+			else{
+				checkSeq = CMSErrors.ERR_MICROS9700_POS_INVALID_RESPONSE;
+			}
+			
+			tableStatus = checkSeq;
+		}//end of if(postOrdAtStartTxnBool
+		
+		return tableStatus;
+	}
+
+	private long startTransactionRemote(String tableID, int restaurantRef){
+		long tableStatus = CMSErrors.FAILURE;
+		List<String> openTables = getOpenChecksFromMicros9700(restaurantRef);
+		
+		if(openTables != null){
+			if(openTables.contains(tableID)){
+				tableStatus = CMSErrors.ERR_MICROS9700_POS_TABLE_BUSY;
+			}
+			else{
+				tableStatus = CMSErrors.SUCCESS;
+			}
+		}
+		else{
+			tableStatus = CMSErrors.ERR_MICROS9700_POS_START_TRANSACTION_FAILED;
+		}
+		return tableStatus;
+	}
+	
+	public GetOpenCheckSLUListResponse getMicros9700ChecksForTableStatus(int restaurantRef){
+		return (GetOpenCheckSLUListResponse)callMicros9700Remote("", "ChecksForTableStatus", "", restaurantRef);
+	}
+	
+	
+	private String verifyPOSTabRemote(String checkid, int restaurantRef){
+		String guid = getOpenChecksToVerifyTab(checkid, restaurantRef);
+		return guid;
+	}
+	
+	@Override
+	public int addItems(String tableID, String empID, String currCaptain, String empName, int nGuests, String deviceID, long orderID, List<POSMenuItemInfo> menuItemsList, 
+			int restaurantRef, Object ... otherInfo) throws RestaurantIntegrationAPIException {
+
+		int checkSeq = CMSErrors.FAILURE;
+		
+		String checkIdConstructed = "";
+		String checkIdResponse = "";
+		try{
+			if(otherInfo == null){
+				otherInfo = new Object[]{""};
+			}
+			log.debug("orderID : "+ orderID + ", menuItemsList : "+menuItemsList+" , restaurantRef : "+restaurantRef+", otherInfo : "+otherInfo);
+			String intfcVer = getInterfaceVersion(restaurantRef);
+			String clientName = getClientIdForThis();//getClientName(restaurantRef);
+			String orderType = getMicros9700OrderType(restaurantRef);
+			
+			 StringBuffer xmlToSendBuff = new StringBuffer("<?xml version=\"1.0\" encoding=\"utf-8\"?>"+
+	        "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">"+
+	        "<soap:Body>");
+			 if(orderID > 0){
+				 xmlToSendBuff.append("<AddToCheck xmlns=\"http://www.micros.com/pos/les/TransactionServices\">");
+			 }
+			 else{
+				 xmlToSendBuff.append("<PostTransaction xmlns=\"http://www.micros.com/pos/les/TransactionServices\">");
+			 }
+			 xmlToSendBuff.append("<REQ>"+
+	        "<RequestHeader>"+
+	        "<InterfaceVersion>" + intfcVer + "</InterfaceVersion>"+
+	        "<ClientName>" + clientName + "</ClientName>"+
+	        "</RequestHeader>");
+	  			
+			List<POSModifierValueInfo> alModifiers = null;
+			POSModifierValueInfo objPOSModifierValueInfo = null;
+			
+			xmlToSendBuff.append("<CheckDetailEntries>");
+			
+			if(menuItemsList != null && menuItemsList.size() > 0){
+				for(POSMenuItemInfo posMenuItem : menuItemsList){
+					if(posMenuItem.getSeatNo() ==null || "".equals(posMenuItem.getSeatNo().toString().trim()) ) {
+						posMenuItem.setSeatNo(1);
+					}					
+					
+					String strMenuItemPOSID = (posMenuItem.getPosID() == null || posMenuItem.getPosID().trim().equals(""))
+											? "0" : posMenuItem.getPosID().trim();	
+					//String strSpecRequest = posMenuItem.getSpecialRequest() == null ||  "".equals(posMenuItem.getSpecialRequest().trim()) ? "" : posMenuItem.getSpecialRequest();
+					//strSpecRequest = strSpecRequest.replaceAll("&", "&amp;");
+					//strSpecRequest = strSpecRequest.replaceAll("<", "&lt;");
+					//strSpecRequest = strSpecRequest.replaceAll(">", "&gt;");
+					//strSpecRequest = strSpecRequest.replaceAll("\"", "&quot;");
+					//strSpecRequest = strSpecRequest.replaceAll("'", "&#39;");
+					
+					if("0".equals(strMenuItemPOSID)) {
+						if (posMenuItem.getModifierValues().size() == 0) {
+							log.error("Menu item " + posMenuItem.getName() + " does not have a POS ID and has no modifiers");
+							return CMSErrors.ERR_MICROS9700_NO_POSID_NO_MODIFIERS;
+						}
+						
+						boolean bNoMandatoryModifier = true;
+						for(POSModifierValueInfo modifier : posMenuItem.getModifierValues()) {
+							if ("mandatory".equalsIgnoreCase(modifier.getFlag())) {
+								bNoMandatoryModifier = false;
+								break;
+							}
+						}
+						if(bNoMandatoryModifier) {
+							log.error("Menu item " + posMenuItem.getName() + " does not have a POS ID and a mandatory modifier");
+							return CMSErrors.ERR_MICROS9700_NO_POSID_NO_MANDATORY_MODIFIER;
+						}
+						
+						boolean bNoModifiers = true;
+						for(POSModifierValueInfo modifier : posMenuItem.getModifierValues()) {
+							if (!"0".equals(modifier.getPosID())) {
+								bNoModifiers = false;
+								break;
+							}
+						}
+						if(bNoModifiers) {
+							log.error("Menu item " + posMenuItem.getName() + " does not have a POS ID and has no modifier with POS ID");
+							return CMSErrors.ERR_MICROS9700_NO_POSID_NO_MODIFIER_POSID;
+						}
+						
+						alModifiers = posMenuItem.getModifierValues(); 
+						StringBuffer xmlForModsBuff = new StringBuffer();
+						boolean itemFound = false;
+						for(int j=0; j<alModifiers.size(); j++) {
+							
+							objPOSModifierValueInfo = alModifiers.get(j);
+							String strModifierPOSID = (objPOSModifierValueInfo.getPosID() == null 
+									|| objPOSModifierValueInfo.getPosID().trim().equals("")) 
+									? "0" : objPOSModifierValueInfo.getPosID().trim();
+							
+							
+							
+							if(objPOSModifierValueInfo.isSpecialRequest()){//this condiment is a special request
+								xmlForModsBuff.append("<Condiment>");
+								String spReqStr = objPOSModifierValueInfo.getSpecialReqText();
+								spReqStr = spReqStr == null || "".equals(spReqStr.trim()) ? "" : spReqStr.trim();
+								spReqStr = spReqStr.replaceAll("&", "&amp;");
+								spReqStr = spReqStr.replaceAll("<", "&lt;");
+								spReqStr = spReqStr.replaceAll(">", "&gt;");
+								spReqStr = spReqStr.replaceAll("\"", "&quot;");
+								spReqStr = spReqStr.replaceAll("'", "&#39;");
+								
+								xmlForModsBuff.append("<ReferenceEntry>"+spReqStr+"</ReferenceEntry>");
+								xmlForModsBuff.append("<Count>"+(int)posMenuItem.getQuantity()+"</Count>"+
+										"<Price>0</Price>"+
+										"<ItemNumber>"+strModifierPOSID +"</ItemNumber>"+
+										"<PriceLevel>1</PriceLevel>"+
+										"</Condiment>");
+								continue;
+							}
+							
+							
+							if(strModifierPOSID.startsWith("mod|")){
+								
+								int modIndex = strModifierPOSID.indexOf("mod|");
+								strModifierPOSID = strModifierPOSID.substring(modIndex+4);
+								
+								xmlForModsBuff.append("<Condiment>");
+								
+								xmlForModsBuff.append("<ReferenceEntry xsi:nil=\"true\" />");
+								xmlForModsBuff.append("<Count>"+(int)posMenuItem.getQuantity()+"</Count>"+
+								"<Price>0</Price>"+
+								"<ItemNumber>"+strModifierPOSID +"</ItemNumber>"+
+								"<PriceLevel>1</PriceLevel>"+
+								"</Condiment>");
+							}
+							else if(!strModifierPOSID.equals("0")) {
+								itemFound=true;
+								xmlToSendBuff.append("<MenuItem>");
+							
+								xmlToSendBuff.append("<ReferenceEntry xsi:nil=\"true\" />");
+								 
+								xmlToSendBuff.append("<Count>"+(int)posMenuItem.getQuantity()+"</Count>"+
+						        "<Price>0</Price>"+
+						        "<ItemNumber>"+strModifierPOSID+"</ItemNumber>"+
+						        "<PriceLevel>1</PriceLevel>"+
+						        "<Seat>"+posMenuItem.getSeatNo()+"</Seat>"+
+						        "</MenuItem>");
+							}
+						}//end of modifiers for
+						if(xmlForModsBuff.length()>0 && itemFound){
+							xmlToSendBuff.append(xmlForModsBuff);
+						}
+					}
+					else{	
+						xmlToSendBuff.append("<MenuItem>");
+						/*if(!"".equals(strSpecRequest)){
+							
+							xmlToSendBuff.append("<ReferenceEntry>" + strSpecRequest + "</ReferenceEntry>");
+						}
+						else{
+							xmlToSendBuff.append("<ReferenceEntry>Blah Main</ReferenceEntry>");
+						}*/
+						xmlToSendBuff.append("<ReferenceEntry xsi:nil=\"true\" />");
+						xmlToSendBuff.append("<Count>"+(int)posMenuItem.getQuantity()+"</Count>"+
+				        "<Price>0</Price>"+
+				        "<ItemNumber>"+posMenuItem.getPosID()+"</ItemNumber>"+
+				        "<PriceLevel>1</PriceLevel>"+
+				        "<Seat>"+posMenuItem.getSeatNo()+"</Seat>"+
+				        "</MenuItem>");
+					
+						
+						//setting condiments(modifiers) to this menuitem
+						List<POSModifierValueInfo> allCMSModifiers = posMenuItem.getModifierValues();
+	
+						if(allCMSModifiers != null && allCMSModifiers.size() > 0){
+							for(POSModifierValueInfo cmsModifier : allCMSModifiers){
+								String posId = cmsModifier.getPosID() == null || cmsModifier.getPosID().trim().isEmpty() ? "" : cmsModifier.getPosID().trim();
+								xmlToSendBuff.append("<Condiment>");
+								
+								if(cmsModifier.isSpecialRequest()){//this condiment is a special request
+									String spReqStr = cmsModifier.getSpecialReqText();
+									spReqStr = spReqStr == null || "".equals(spReqStr.trim()) ? "" : spReqStr.trim();
+									spReqStr = spReqStr.replaceAll("&", "&amp;");
+									spReqStr = spReqStr.replaceAll("<", "&lt;");
+									spReqStr = spReqStr.replaceAll(">", "&gt;");
+									spReqStr = spReqStr.replaceAll("\"", "&quot;");
+									spReqStr = spReqStr.replaceAll("'", "&#39;");
+									
+									xmlToSendBuff.append("<ReferenceEntry>"+spReqStr+"</ReferenceEntry>");
+								}
+								else{
+									xmlToSendBuff.append("<ReferenceEntry xsi:nil=\"true\" />");
+								}
+								xmlToSendBuff.append("<Count>"+(int)posMenuItem.getQuantity()+"</Count>"+
+								"<Price>0</Price>"+
+								"<ItemNumber>"+posId +"</ItemNumber>"+
+								"<PriceLevel>1</PriceLevel>"+
+								"</Condiment>");
+							}//end of inner condiment's for
+						}
+					}
+				}//end of outer for
+			}
+			
+			if(otherInfo[0].toString().trim().equals("kioskorder") 
+					|| otherInfo[0].toString().trim().equals("opentab-assisted-end")){ //in case of kiosk/End-open Tab/ End-Assited order, sending CashTender to 9700
+				String tenderMedia = getMicros9700KioskCashTenderMedia(restaurantRef).trim();//same value for opentab/assited mode orders
+				String currNum = getMicros9700KioskCurrNum(restaurantRef).trim();//same value for opentab/assited mode orders
+				
+				xmlToSendBuff.append("<CashTender>" +
+				"<TenderMediaNumber>"+ tenderMedia + "</TenderMediaNumber>" +
+				"<CurrencyNumber>" + currNum + "</CurrencyNumber>" +
+				"<Amount>" + otherInfo[1] + "</Amount>");
+				
+				String tipAmt = otherInfo[2].toString();
+				if(tipAmt.trim().equals("")){
+					xmlToSendBuff.append("<TipAmount>0.00</TipAmount>");
+				}
+				else{
+					xmlToSendBuff.append("<TipAmount>"+tipAmt+"</TipAmount>");
+				}
+				xmlToSendBuff.append("</CashTender>");
+			}
+			
+			xmlToSendBuff.append("</CheckDetailEntries><CheckHeaderRequest>");
+			
+			SimpleDateFormat dateFormat = new SimpleDateFormat("ddHHmmss");
+			String currentTimeStamp = dateFormat.format(new Date());
+			
+			if(otherInfo[0].toString().trim().equals("kioskorder")){
+				if(tableID != null && !"".equals(tableID.trim())){//line busting order - if it has table info
+					
+					checkIdConstructed = tableID + "@" + currentTimeStamp;
+					xmlToSendBuff.append("<CheckId>"+ checkIdConstructed + "</CheckId>");
+				}
+				else{ //kiosk order or line busting if it doesnt have table info
+					checkIdConstructed = deviceID + "@" + currentTimeStamp;
+					xmlToSendBuff.append("<CheckId>"+ checkIdConstructed +  "</CheckId>");
+				}
+			}
+			else{
+				 if(orderID > 0){
+					 if(otherInfo[0].toString().trim().equals("opentab-assisted-end")){
+						 checkIdConstructed = otherInfo[4].toString();
+						 xmlToSendBuff.append("<CheckId>" + checkIdConstructed +"</CheckId>");
+					 }
+					 else{
+						 checkIdConstructed = otherInfo[1].toString();
+						 xmlToSendBuff.append("<CheckId>" + checkIdConstructed +"</CheckId>");
+					 }
+				 }
+				 else if(orderID == 0){
+					 checkIdConstructed = tableID + "@" + currentTimeStamp;
+					 xmlToSendBuff.append("<CheckId>" + checkIdConstructed +"</CheckId>");
+				 }
+			}
+			
+			xmlToSendBuff.append("<GuestInformation>"+
+			        "<ID />"+
+			        "<FirstName />"+
+			        "<LastName />"+
+			        "<Address1 />"+
+			        "<Address2 />"+
+			        "<Address3 />"+
+			        "<PhoneNum />"+
+			        "<UserText1 />"+
+			        "<UserText2 />"+
+			        "<UserText3 />"+
+			        "<GUID />"+
+			        "</GuestInformation>"+
+			        "<CheckEmployeeNumber>"+empID+"</CheckEmployeeNumber>"+
+			        "</CheckHeaderRequest>"+
+			       "<OrderTypeNumber>"+orderType+"</OrderTypeNumber>"+
+			        "</REQ>");
+			
+			if(orderID > 0){
+				if(otherInfo[0].toString().trim().equals("opentab-assisted-end")){
+					xmlToSendBuff.append("<Check_Guid>"+otherInfo[3].toString()+"</Check_Guid>"+
+							"</AddToCheck>");
+				}
+				else{
+					xmlToSendBuff.append("<Check_Guid>"+otherInfo[0].toString()+"</Check_Guid>"+
+									"</AddToCheck>");
+				}
+			}
+			else{
+				xmlToSendBuff.append("</PostTransaction>");
+			}
+			xmlToSendBuff.append("</soap:Body>"+
+				"</soap:Envelope>");
+			        
+			log.debug("XML being sent to micros9700 :");
+			log.debug(""+xmlToSendBuff);
+			
+			String resXML = "";
+			if(orderID > 0) {
+				//existing check
+				resXML = callMicros9700Remote(xmlToSendBuff.toString(), "AddToCheck", tableID,  restaurantRef).toString();
+			}else{
+				//new check
+				resXML = callMicros9700Remote(xmlToSendBuff.toString(), "PostTransaction", tableID, restaurantRef).toString();
+			}
+			log.debug("Response XML received from micros9700 :");
+			log.debug(resXML);
+			
+			String checkNum = "";
+			String checkGuid = "";
+			if(resXML != null && !"".equals(resXML.trim())){
+				ParseXMLDOM parseXMLDOM = new ParseXMLDOM();
+				String successStatus = parseXMLDOM.parseDOMForTag(resXML, "Success");
+				
+				if(successStatus != null && successStatus.trim().equalsIgnoreCase("true")){
+					checkNum = parseXMLDOM.parseDOMForTag(resXML, "CheckNumber");
+					checkGuid = parseXMLDOM.parseDOMForTag(resXML, "CheckGuid");
+					checkIdResponse = parseXMLDOM.parseDOMForTag(resXML, "CheckID");
+					checkSeq = CMSErrors.SUCCESS; 
+				}
+				else if(successStatus.trim().equalsIgnoreCase("false")){
+					boolean isError = parseXMLDOM.parseDOMErrorsMicros9700(resXML);
+					
+					if(isError){
+						String errorMsg = parseXMLDOM.parseDOMErrorTextMicros9700(resXML);
+						log.debug("Error at POS in addItems:: " + errorMsg);
+					}
+					else{
+						log.debug("AddItems failed but no error message from micros 9700");
+					}
+					checkSeq = CMSErrors.ERR_MICROS9700_ERROR_AT_POS;
+				}
+				else{
+					checkSeq = CMSErrors.ERR_MICROS9700_ERROR_AT_POS;
+				}
+			}
+			else{
+				checkSeq = CMSErrors.ERR_MICROS9700_POS_INVALID_RESPONSE;
+			}
+			
+			if(checkSeq == CMSErrors.SUCCESS){
+				if((checkNum != null && !"".equals(checkNum.trim())) && (checkGuid != null && !"".equals(checkGuid.trim()))){
+
+					//&& (checkId != null && !"".equals(checkId.trim()))){ //commented since checkId was coming blank in twin rivers setup in response
+					
+					if(checkIdResponse == null || "".equals(checkIdResponse.trim())){
+						checkIdResponse = checkIdConstructed;
+					}
+					
+					if(otherInfo[0].toString().trim().equals("opentab-assisted-end")){
+						if(menuItemsList==null){
+							menuItemsList = new ArrayList<POSMenuItemInfo>();
+						}
+						menuItemsList.add(new POSMenuItemInfo());
+					}
+					this.updateParamMenuItemListToTransferDataToCaller(checkNum, checkGuid, checkIdResponse, menuItemsList);
+				}
+				else{
+					checkSeq = CMSErrors.ERR_MICROS9700_INVALID_CHECKNUMBER;
+				}
+			}
+		}catch (Exception e) {
+			logMessage("Exception: in calling Micros9700Webservice addItems for -->orderID  "+orderID +" in POS for :: empID  --> "+empID +"  tableID --> "+tableID);
+			e.printStackTrace();
+			return checkSeq;
+		}
+		
+		
+		return checkSeq;
+	}
+
+
+	@Override
+	public int printToKitchen(long orderID) throws RestaurantIntegrationAPIException {
+		return 0;
+	}
+
+	
+	@Override
+	public int endSession(String tableID, long orderID, String empID, int guests, int totalItems, String CMSUserID, Object ... otherInfo) throws RestaurantIntegrationAPIException {
+		return CMSErrors.SUCCESS;
+	}
+	
+	@Override
+	public TYPE getIntegrationType() {
+		return TYPE.MICROS9700;
+	}
+
+	@Override
+	public int voidItem(String tableID, String empID, String deviceID, long orderID, POSMenuItemInfo menuItem, String remark, int remarkCode, String cmsUserID, Object ... otherInfo) throws RestaurantIntegrationAPIException{
+
+		int retVal = CMSErrors.SUCCESS;
+		return retVal;
+	}
+	
+	private void updateParamMenuItemListToTransferDataToCaller(String strKOTNo, String check_guid, String checkId, List<POSMenuItemInfo> menuItemsList) throws RestaurantIntegrationAPIException {
+		List<String> posMenuItemInfoList = null;
+		try {
+			for(int i=0; i<menuItemsList.size(); i++) {
+				posMenuItemInfoList = new ArrayList<String>();			
+				posMenuItemInfoList.add(strKOTNo + "|" + checkId + "|" + check_guid);
+				menuItemsList.get(i).setPosKOTNumber(strKOTNo + "|" + checkId + "|" + check_guid);
+				menuItemsList.get(i).setPosOrderItemNumbers(strKOTNo);
+				menuItemsList.get(i).setPosOrderItemNumbersList(posMenuItemInfoList);				
+			}
+		}catch (Exception e) {
+			e.printStackTrace();
+			logMessage("Error While Parameter Menu Item(s) List.");
+		}	
+	}
+	
+	private GetOpenCheckSLUListResponse getOpenChecksFromMicros9700ForTblStatus(int restaurantRef){
+		GetOpenCheckSLUListResponse res = null;
+		
+		TransactionServices6Locator txnServiceLocator = new TransactionServices6Locator();
+		String url = getServURL(restaurantRef);
+		txnServiceLocator.setTransactionServices6SoapEndpointAddress(url);
+		
+		try {
+			GetOpenCheckSLUListRequest req = new GetOpenCheckSLUListRequest();
+			RequestHeader rh = new RequestHeader();
+			String clientName = getClientIdForThis();
+			String interfaceVesion = getInterfaceVersion(restaurantRef);
+			rh.setClientName(clientName);
+			rh.setInterfaceVersion(interfaceVesion);
+			req.setRequestHeader(rh);
+			
+			res = txnServiceLocator.getTransactionServices6Soap().getOpenCheckList(req);
+			
+			log.debug("getOpenChecksFromMicros9700ForTblStatus exitting : ");
+		} catch (RemoteException e) {
+			e.printStackTrace();
+		} catch (ServiceException e) {
+			e.printStackTrace();
+		}
+		return res;
+	}
+	
+	private List<String> getOpenChecksFromMicros9700(int restaurantRef){
+    	
+		TransactionServices6Locator txnServiceLocator = new TransactionServices6Locator();
+		String url = getServURL(restaurantRef);//TitbitBackendConfig.getMicros9700ServiceURL(this.currentRestaurantId);
+		txnServiceLocator.setTransactionServices6SoapEndpointAddress(url);
+		
+		List<String> tablesWithOpenChecksList = new ArrayList<String>();
+		try {
+			GetOpenCheckSLUListRequest req = new GetOpenCheckSLUListRequest();
+			RequestHeader rh = new RequestHeader();
+			String clientName = getClientIdForThis();//TitbitBackendConfig.getMicros9700ClientName(this.currentRestaurantId);
+			String interfaceVesion = getInterfaceVersion(restaurantRef);//TitbitBackendConfig.getMicros9700InterfaceVersion(this.currentRestaurantId);
+			rh.setClientName(clientName);
+			rh.setInterfaceVersion(interfaceVesion);
+			req.setRequestHeader(rh);
+			
+			GetOpenCheckSLUListResponse res = txnServiceLocator.getTransactionServices6Soap().getOpenCheckList(req);
+			OpenCheckSLUEntry [] sluEntries = res.getOpenCheckDetails();
+			com.titbit.integration.micros9700.Error[] errors = res.getOperationResult().getErrors();
+			//log.debug("Errors length in getOpenChecksFromMicros9700=="+errors.length);
+			if(errors !=null)
+			for(int i=0;i<errors.length;i++){
+				log.debug("Error in getOpenChecksFromMicros9700 TableStatusCronJob ::"+errors[i].getErrorCode()+"::"+errors[i].getErrorText());
+				tablesWithOpenChecksList = null;
+			}
+			
+			if(tablesWithOpenChecksList != null){
+				if(sluEntries != null){
+					for(int i=0; i<sluEntries.length; i++){
+						String tblNum = sluEntries[i].getTbl()+"";
+						if(!tblNum.equals("0") && (!tablesWithOpenChecksList.contains(tblNum))){
+							tablesWithOpenChecksList.add(tblNum); 
+						}
+					}
+				}else{
+					log.debug("ERROR:: NULL open checks returned from micros 9700");
+					tablesWithOpenChecksList = null;
+				}
+			}
+			log.debug("tablesWithOpenChecksList for startTxn : "+tablesWithOpenChecksList);
+		} catch (RemoteException e) {
+			tablesWithOpenChecksList = null;
+			e.printStackTrace();
+		} catch (ServiceException e) {
+			tablesWithOpenChecksList = null;
+			e.printStackTrace();
+		}
+		return tablesWithOpenChecksList;
+	}
+
+	private String getOpenChecksToVerifyTab(String checkIdParam, int restaurantRef){
+    	
+		String guid = "";
+		TransactionServices6Locator txnServiceLocator = new TransactionServices6Locator();
+		String url = getServURL(restaurantRef);
+		txnServiceLocator.setTransactionServices6SoapEndpointAddress(url);
+		
+		try {
+			GetOpenCheckSLUListRequest req = new GetOpenCheckSLUListRequest();
+			RequestHeader rh = new RequestHeader();
+			String clientName = getClientIdForThis();
+			String interfaceVesion = getInterfaceVersion(restaurantRef);
+			rh.setClientName(clientName);
+			rh.setInterfaceVersion(interfaceVesion);
+			req.setRequestHeader(rh);
+			
+			GetOpenCheckSLUListResponse res = txnServiceLocator.getTransactionServices6Soap().getOpenCheckList(req);
+			OpenCheckSLUEntry [] sluEntries = res.getOpenCheckDetails();
+			com.titbit.integration.micros9700.Error[] errors = res.getOperationResult().getErrors();
+			//log.debug("Errors length in getOpenChecksFromMicros9700=="+errors.length);
+			if(errors !=null)
+			for(int i=0;i<errors.length;i++){
+				log.debug("Error in getOpenChecksToVerifyTab ::"+errors[i].getErrorCode()+"::"+errors[i].getErrorText());
+			}
+			
+			if(sluEntries != null){
+				for(int i=0; i<sluEntries.length; i++){
+					OpenCheckSLUEntry sluEntry = sluEntries[i];
+					//String checkid = sluEntry.getId();
+					String checkNum = sluEntry.getNumber()+"";
+					if(checkNum != null && checkNum.trim().equalsIgnoreCase(checkIdParam)){
+						guid = sluEntry.getId().trim()+"|"+sluEntry.getGuid();
+						break;
+					}
+				}
+				if(guid.equals("")){
+					guid = "Not found in Micros, CheckId : "+checkIdParam;
+				}
+			}else{
+				log.debug("ERROR:: NULL open checks returned from micros 9700");
+				guid = "Not found in Micros, CheckId : "+checkIdParam;
+			}
+			log.debug("micros9700 checkid : "+checkIdParam+" has guid : "+guid);
+		} catch (RemoteException e) {
+			e.printStackTrace();
+		} catch (ServiceException e) {
+			e.printStackTrace();
+		}
+		return guid;
+	}
+
+	@Override
+	public int transferTable(String orderNumber, String fromTableCode,
+			String toTableCode, Object ... otherinfo) throws RestaurantIntegrationAPIException {
+		return 0;
+	}
+
+
+	@Override
+	public int changeServerAndGuests(String tableID, String orderID,
+			String oldServerID, String newServerID, int noOfGuests)
+			throws RestaurantIntegrationAPIException {
+		return 0;
+	}
+
+
+	@Override
+	public int attachOrDetachTable(String orderID, String primaryTable,
+			ArrayList<String> alTableKeys, boolean isAttach, int restaurantRef)
+			throws RestaurantIntegrationAPIException {
+		return 0;
+	}
+
+	@Override
+	public int updateItemChargeableStatus(String orderID,
+			POSMenuItemInfo menuItemInfo, String strServerID,String strCMSUserID,
+			String remarkCode, String remarkDetails)
+			throws RestaurantIntegrationAPIException {
+		return 0;
+	} 
+	
+	private void logMessage(String msg){
+		if(log.isDebugEnabled()){
+			log.debug(msg);
+		}
+	}
+	
+	private List<POSMenuItemInfo> fetchPOSMenuItemsRemote(int restaurantId){
+		List<POSMenuItemInfo> allItems = null;
+		try{			
+			com.titbit.integration.micros9700.dataaccess.RequestHeader rh = new com.titbit.integration.micros9700.dataaccess.RequestHeader();
+			String clientName =getClientIdForThis();//TitbitBackendConfig.getMicros9700ClientName(this.currentRestaurantId);
+			String dataAccessInterfaceVesion = getDataAccessInterfaceVersion(restaurantId);//TitbitBackendConfig.getMicros9700InterfaceVersion(this.currentRestaurantId);
+			rh.setClientName(clientName);
+			rh.setInterfaceVersion(dataAccessInterfaceVesion);
+			
+			GetMenuItemsRequest getMenuItemsRequest = new GetMenuItemsRequest();
+			getMenuItemsRequest.setRequestHeader(rh);
+			
+			serviceLocatorDownloads = new MicrosExportPosAPILocator();
+			String downloadsURL = getServDownloadsURL(restaurantId);
+			serviceLocatorDownloads.setmicrosExportPosAPISoapEndpointAddress(downloadsURL);
+			MicrosExportPosAPISoap_PortType portType= serviceLocatorDownloads.getmicrosExportPosAPISoap();
+			
+			GetMenuItemsResponse responseObj = portType.getMenuItems(getMenuItemsRequest);
+			
+			if(responseObj.getOperationResult().isSuccess()){
+				allItems = new ArrayList<POSMenuItemInfo>();
+				MenuItemDefinition[] menuItemDefinitions = responseObj.getMenuItemDefinitions();
+				
+				for(int i=0;i<menuItemDefinitions.length;i++){
+					POSMenuItemInfo posItem =  new POSMenuItemInfo();
+					
+					MenuItemDefinition menuItemDefinition = menuItemDefinitions[i];
+					
+					String itemName = menuItemDefinition.getMenuItemName();
+					itemName = itemName != null ? itemName.trim() : "";
+					itemName = itemName.replaceAll("\"", " ").trim();
+					posItem.setName(itemName.trim());
+					
+					MenuItemPrice menuItemPrices[] = menuItemDefinition.getMenuItemPrices();
+					if(menuItemPrices != null && menuItemPrices.length > 0){
+						float price = menuItemPrices[0].getPrice().floatValue();
+						posItem.setPrice(price);
+					}
+					
+					long itemNum = menuItemDefinition.getMenuItemNumber();
+					posItem.setPosID(itemNum+"");
+					allItems.add(posItem);
+					
+				}//end of for
+			}
+			else{
+				com.titbit.integration.micros9700.dataaccess.Error [] errs = responseObj.getOperationResult().getErrors();
+				for(int j=0; j < errs.length; j++){
+					log.debug("fetchPOSMenuItems :: Error Message :: error code : "+errs[j].getErrorCode()+" , error text : "+errs[j].getErrorText());
+				}
+				allItems = null;
+			}
+		}
+		catch (ServiceException e) {
+			log.error("fetchPOSMenuItems :: ServiceException calling IDine regularMenuItemForTitbit Idine", e);
+		}
+		catch (RemoteException e) {
+			log.error("fetchPOSMenuItems :: Remote error calling IDine regularMenuItemForTitbit Idine", e);
+		}
+		return allItems;
+	}
+	
+	@Override
+	public List<POSMenuItemInfo> fetchPOSMenuItems(int restaurantId)
+			throws RestaurantIntegrationAPIException {
+		return (List<POSMenuItemInfo>)callMicros9700Remote("", "fetchPOSMenuItems", "0", restaurantId);
+	}
+	
+	private List<POSMenuItemInfo> fetchDeletedPOSMenuItemsRemote(int restaurantId){
+
+		List<POSMenuItemInfo> allItems = null;
+		try{			
+			com.titbit.integration.micros9700.dataaccess.RequestHeader rh = new com.titbit.integration.micros9700.dataaccess.RequestHeader();
+			String clientName = getClientIdForThis();//TitbitBackendConfig.getMicros9700ClientName(this.currentRestaurantId);
+			String dataAccessInterfaceVesion = getDataAccessInterfaceVersion(restaurantId);//TitbitBackendConfig.getMicros9700InterfaceVersion(this.currentRestaurantId);
+			rh.setClientName(clientName);
+			rh.setInterfaceVersion(dataAccessInterfaceVesion);
+			
+			GetOutOfMenuItemsRequest getOutOfMenuItemsRequest = new GetOutOfMenuItemsRequest();
+			getOutOfMenuItemsRequest.setRequestHeader(rh);
+			
+			serviceLocatorDownloads = new MicrosExportPosAPILocator();
+			String downloadsURL = getServDownloadsURL(restaurantId);
+			serviceLocatorDownloads.setmicrosExportPosAPISoapEndpointAddress(downloadsURL);
+			MicrosExportPosAPISoap_PortType portType= serviceLocatorDownloads.getmicrosExportPosAPISoap();
+			
+			GetOutOfMenuItemsResponse responseObj = portType.getOutOfMenuItems(getOutOfMenuItemsRequest);
+			
+			if(responseObj.getOperationResult().isSuccess()){
+				allItems = new ArrayList<POSMenuItemInfo>();
+				long[] menuPosIds = responseObj.getArrayOfOutOfMenuItem();
+				
+				if(menuPosIds != null){
+					for(int i=0;i<menuPosIds.length;i++){
+						POSMenuItemInfo posItem =  new POSMenuItemInfo();
+						
+						posItem.setPosID(menuPosIds[i]+"");
+						allItems.add(posItem);
+						
+					}//end of for
+				}
+			}
+			else{
+				com.titbit.integration.micros9700.dataaccess.Error [] errs = responseObj.getOperationResult().getErrors();
+				for(int j=0; j < errs.length; j++){
+					log.debug("fetchDeletedPOSMenuItems : Error Message :: error code : "+errs[j].getErrorCode()+" , error text : "+errs[j].getErrorText());
+				}
+				allItems = null;
+			}
+		}
+		catch (ServiceException e) {
+			log.error("fetchDeletedPOSMenuItems :: ServiceException calling IDine regularMenuItemForTitbit Idine", e);
+		}
+		catch (RemoteException e) {
+			log.error("fetchDeletedPOSMenuItems :: Remote error calling IDine regularMenuItemForTitbit Idine", e);
+		}
+		return allItems;
+	}
+	
+	@Override
+	public List<POSMenuItemInfo> fetchDeletedPOSMenuItems(int restaurantId)
+			throws RestaurantIntegrationAPIException {
+		return (List<POSMenuItemInfo>)callMicros9700Remote("", "fetchDeletedPOSMenuItems", "0", restaurantId);
+	}
+	
+	@Override
+	public Map<String, List<POSModifierValueInfo>> fetchPOSModifiers(int restaurantId)
+			throws RestaurantIntegrationAPIException {
+		return null;
+	}
+
+	@Override
+	public long checkTableStatus(String tableID)
+			throws RestaurantIntegrationAPIException {
+		return 0;
+	}
+
+	@Override
+	public List<String> getOpenChecksOnPOS() throws RestaurantIntegrationAPIException {
+		return null;
+	}
+
+	@Override
+	public boolean settleCheckInPOSWithPayment(Double totalAmt,
+			String posOrderID, String serverID, int guests, String tableID)
+			throws RestaurantIntegrationAPIException {
+		return false;
+	}
+	
+	@Override
+	public int deleteOrder(String tableID, String empID, String currCaptain,
+			String empName, int nGuests, String deviceID, long orderID,
+			List<POSMenuItemInfo> menuItems, Object... otherInfo)
+			throws RestaurantIntegrationAPIException {
+		// TODO Auto-generated method stub
+		return 0;
+	}
+	
+	private synchronized Object callMicros9700Remote(String xmlToSend, String remoteCallName,String tableId, int restId){
+		String resXML = "";
+		Object retObj = null;
+		try {
+			if(remoteCallName.equals("startTxn")){
+				retObj = startTransactionRemote(tableId, restId);
+			}
+			else if(remoteCallName.equals("verifyTab")){
+				retObj = verifyPOSTabRemote(tableId, restId);
+			}
+			else if(remoteCallName.equals("fetchPOSMenuItems")){
+				retObj = fetchPOSMenuItemsRemote(restId);
+			}
+			else if(remoteCallName.equals("fetchDeletedPOSMenuItems")){
+				retObj = fetchDeletedPOSMenuItemsRemote(restId);
+			}
+			else if(remoteCallName.equals("ChecksForTableStatus")){
+				retObj = getOpenChecksFromMicros9700ForTblStatus(restId);
+			}
+			else{
+				
+				
+				/////////////////////////////////////////////////////
+				HttpParams httpParameters = new BasicHttpParams();
+				  int timeoutConnection = 9000;
+				  HttpConnectionParams.setConnectionTimeout(httpParameters, timeoutConnection);
+				  int timeoutSocket = 9000;
+				  HttpConnectionParams.setSoTimeout(httpParameters, timeoutSocket);
+
+				/////////////////////////////////////////////////////////
+				  DefaultHttpClient httpclient = new DefaultHttpClient(httpParameters);
+				HttpPost httppost = new HttpPost(getServURL(restId));
+		        
+		        StringEntity se = new StringEntity( xmlToSend.toString(), HTTP.UTF_8);
+		        se.setContentType("text/xml");
+		        httppost.setEntity(se); 
+		        //httpclient.set
+		        HttpResponse httpresponse = httpclient.execute(httppost);
+		        HttpEntity resEntity = httpresponse.getEntity();
+		         
+		        BufferedReader reader = new BufferedReader(new InputStreamReader(resEntity.getContent()));
+		        /*char[] res = new char[(int)resEntity.getContentLength()];
+		        reader.read(res, 0, (int)resEntity.getContentLength());*/
+		        
+		        StringBuilder sb = new StringBuilder();
+		        String line = reader.readLine();
+		        while (line != null) {
+		            sb.append(line);
+		            line = reader.readLine();
+		        }
+	        
+		        resXML = sb.toString().trim();
+		        log.debug("Response XML from remote for operation : "+remoteCallName);
+		        log.debug(resXML);
+		        retObj = resXML;
+			}
+		} catch (UnsupportedEncodingException e) {
+			log.debug("UnsupportedEncodingException in Micros9700 web service call for operation : "+remoteCallName);
+			e.printStackTrace();
+			return null;
+		}
+		catch (IOException e) {
+			log.debug("IOException in Micros9700 web service call for operation : "+remoteCallName);
+			e.printStackTrace();
+			return null;
+		}
+		catch (Exception e) {
+			log.debug("Exception in Micros9700 web service call for operation : "+remoteCallName);
+			e.printStackTrace();
+			return null;
+		}
+		return retObj;
+	}
+	
+	public CalculateTotalsResponse calculateTotalsMicros9700(ArrayList<POSMenuItemInfo> menuItemsList, int restId){
+
+		CalculateTotalsResponse calcTotalsResponse = new CalculateTotalsResponse();
+		
+		try{
+			 StringBuffer xmlToSendBuff = new StringBuffer("<?xml version=\"1.0\" encoding=\"utf-8\"?>"+
+	        "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">"+
+	        "<soap:Body>");
+			
+			 xmlToSendBuff.append("<CalculateTotals xmlns=\"http://www.micros.com/pos/les/TransactionServices\">");
+			
+			 xmlToSendBuff.append("<REQ>"+
+	        "<RequestHeader>"+
+	        "<InterfaceVersion>" + getInterfaceVersion(restId) + "</InterfaceVersion>"+
+	        "<ClientName>" + getClientName(restId) + "</ClientName>"+
+	        "</RequestHeader>");
+	  			
+			if(menuItemsList != null && menuItemsList.size() > 0){
+				
+				xmlToSendBuff.append("<CheckDetailEntries>");
+				
+				for(POSMenuItemInfo posMenuItem : menuItemsList){
+					String strMenuItemPOSID = (posMenuItem.getPosID() == null || posMenuItem.getPosID().trim().equals(""))
+							? "0" : posMenuItem.getPosID().trim();
+				
+					/*	& - &amp; 
+						< - &lt; 
+						> - &gt; 
+						" - &quot; 
+						' - &#39; 
+					 */
+					String strSpecRequest = posMenuItem.getSpecialRequest() == null ||  "".equals(posMenuItem.getSpecialRequest().trim()) ? "" : posMenuItem.getSpecialRequest();
+					strSpecRequest = strSpecRequest.replaceAll("&", "&amp;");
+					strSpecRequest = strSpecRequest.replaceAll("<", "&lt;");
+					strSpecRequest = strSpecRequest.replaceAll(">", "&gt;");
+					strSpecRequest = strSpecRequest.replaceAll("\"", "&quot;");
+					strSpecRequest = strSpecRequest.replaceAll("'", "&#39;");
+					
+					List<POSModifierValueInfo> allModifiers = posMenuItem.getModifierValues();
+					if("0".equals(strMenuItemPOSID)){
+						if (posMenuItem.getModifierValues().size() == 0) {
+							log.error("Menu item " + posMenuItem.getName() + " does not have a POS ID and has no modifiers");
+							calcTotalsResponse = null;
+							return calcTotalsResponse;
+						}
+						
+						boolean bNoMandatoryModifier = true;
+						for(POSModifierValueInfo modifier : posMenuItem.getModifierValues()) {
+							if ("mandatory".equalsIgnoreCase(modifier.getFlag())) {
+								bNoMandatoryModifier = false;
+								break;
+							}
+						}
+						if(bNoMandatoryModifier) {
+							log.error("Menu item " + posMenuItem.getName() + " does not have a POS ID and a mandatory modifier");
+							calcTotalsResponse = null;
+							return calcTotalsResponse;
+						}
+						
+						boolean bNoModifiers = true;
+						for(POSModifierValueInfo modifier : posMenuItem.getModifierValues()) {
+							if (!"0".equals(modifier.getPosID())) {
+								bNoModifiers = false;
+								break;
+							}
+						}
+						if(bNoModifiers) {
+							log.error("Menu item " + posMenuItem.getName() + " does not have a POS ID and has no modifier with POS ID");
+							calcTotalsResponse = null;
+							return calcTotalsResponse;
+						}
+						
+						allModifiers = posMenuItem.getModifierValues(); 
+						for(int j=0; j<allModifiers.size(); j++) {
+							
+							POSModifierValueInfo objPOSModifierValueInfo = allModifiers.get(j);
+							String strModifierPOSID = (objPOSModifierValueInfo.getPosID() == null 
+									|| objPOSModifierValueInfo.getPosID().trim().equals("")) 
+									? "0" : objPOSModifierValueInfo.getPosID().trim();
+							
+							if(Integer.parseInt(strModifierPOSID) > 0) {
+								xmlToSendBuff.append("<MenuItem>");
+								/*if(!"".equals(strSpecRequest) && j == 0){
+									xmlToSendBuff.append("<ReferenceEntry>" + strSpecRequest + "</ReferenceEntry>");
+								}
+								else{
+									xmlToSendBuff.append("<ReferenceEntry></ReferenceEntry>");
+								}*/
+								xmlToSendBuff.append("<ReferenceEntry xsi:nil=\"true\" />");
+								xmlToSendBuff.append("<Count>"+(int)posMenuItem.getQuantity()+"</Count>"+
+						        "<Price>0</Price>"+
+						        "<ItemNumber>"+strModifierPOSID+"</ItemNumber>"+
+						        "<PriceLevel>1</PriceLevel>"+
+						        "<Seat>1</Seat>"+
+						        "</MenuItem>");
+							}
+						}//end of modifiers for
+					}
+					else{
+						xmlToSendBuff.append("<MenuItem>");
+						/*if(!"".equals(strSpecRequest)){
+							xmlToSendBuff.append("<ReferenceEntry>" + strSpecRequest + "</ReferenceEntry>");
+						}
+						else{
+							xmlToSendBuff.append("<ReferenceEntry></ReferenceEntry>");
+						}*/
+						xmlToSendBuff.append("<ReferenceEntry xsi:nil=\"true\" />");
+						xmlToSendBuff.append("<Count>"+(int)posMenuItem.getQuantity()+"</Count>"+
+				        "<Price>0</Price>"+
+				        "<ItemNumber>"+posMenuItem.getPosID()+"</ItemNumber>"+
+				        "<PriceLevel>1</PriceLevel>"+
+				        "<Seat>1</Seat>"+
+				        "</MenuItem>");
+					
+						
+						//setting condiments(modifiers) to this menuitem
+						allModifiers = posMenuItem.getModifierValues();
+		
+						if(allModifiers != null && allModifiers.size() > 0){
+							for(POSModifierValueInfo cmsModifier : allModifiers){
+								String posId = cmsModifier.getPosID() == null || cmsModifier.getPosID().trim().isEmpty() ? "0" : cmsModifier.getPosID().trim();
+								xmlToSendBuff.append("<Condiment>");
+								
+								if(cmsModifier.isSpecialRequest()){//this condiment is a special request
+									String spReqStr = cmsModifier.getSpecialReqText();
+									spReqStr = spReqStr == null || "".equals(spReqStr.trim()) ? "" : spReqStr.trim();
+									spReqStr = spReqStr.replaceAll("&", "&amp;");
+									spReqStr = spReqStr.replaceAll("<", "&lt;");
+									spReqStr = spReqStr.replaceAll(">", "&gt;");
+									spReqStr = spReqStr.replaceAll("\"", "&quot;");
+									spReqStr = spReqStr.replaceAll("'", "&#39;");
+									xmlToSendBuff.append("<ReferenceEntry>"+spReqStr+"</ReferenceEntry>");
+								}
+								else{
+									xmlToSendBuff.append("<ReferenceEntry xsi:nil=\"true\" />");
+								}
+								
+								xmlToSendBuff.append("<Count>"+(int)posMenuItem.getQuantity()+"</Count>"+
+								"<Price>0</Price>"+
+								"<ItemNumber>"+posId +"</ItemNumber>"+
+								"<PriceLevel>1</PriceLevel>"+
+								"</Condiment>");
+							}//end of inner condiment's for
+						}
+					}
+				}//end of outer for
+			}
+			
+			xmlToSendBuff.append("</CheckDetailEntries>"+
+			        "<OrderTypeNumber>"+ getMicros9700OrderType(restId)+"</OrderTypeNumber>"+
+			        "</REQ>" +
+			        "</CalculateTotals>");
+			xmlToSendBuff.append("</soap:Body>"+
+				"</soap:Envelope>");
+			        
+			log.debug("CalculateTotals call XML being sent to micros9700 :");
+			log.debug(""+xmlToSendBuff);
+			
+			String resXML = callMicros9700Remote(xmlToSendBuff.toString(), "CalculateTotals", "0", restId).toString();//passing irrelevant tableId as 0
+			
+			log.debug("CalculateTotals call XML, Response XML received from micros9700 :");
+			log.debug(resXML);
+			
+			if(resXML != null && !"".equals(resXML.trim())){
+				ParseXMLDOM parseXMLDOM = new ParseXMLDOM();
+				String successStatus = parseXMLDOM.parseDOMForTag(resXML, "Success");
+				if(successStatus != null && successStatus.trim().equalsIgnoreCase("true")){
+					String checkSubtotal = parseXMLDOM.parseDOMForTag(resXML, "CheckSubtotal");
+					String checkOtherTotal = parseXMLDOM.parseDOMForTag(resXML, "CheckOtherTotal");
+					String checkAmountDueTotal = parseXMLDOM.parseDOMForTag(resXML, "CheckAmountDueTotal");
+					String checkTaxTotal = parseXMLDOM.parseDOMForTag(resXML, "CheckTaxTotal");
+					calcTotalsResponse.setCheckSubtotal(new BigDecimal(checkSubtotal));
+					calcTotalsResponse.setCheckOtherTotal(new BigDecimal(checkOtherTotal));
+					calcTotalsResponse.setCheckAmountDueTotal(new BigDecimal(checkAmountDueTotal));
+					calcTotalsResponse.setCheckTaxTotal(new BigDecimal(checkTaxTotal));
+				}
+				else if(successStatus.trim().equalsIgnoreCase("false")){
+					boolean isError = parseXMLDOM.parseDOMErrorsMicros9700(resXML);
+					
+					if(isError){
+						String errorMsg = parseXMLDOM.parseDOMErrorTextMicros9700(resXML);
+						log.debug("Error at POS in CalculateTotals for Kisok :: " + errorMsg);
+					}
+					else{
+						log.debug("CalculateTotals for Kisok, failed but no error message from micros 9700");
+					}
+					calcTotalsResponse = null;
+				}
+				else{
+					calcTotalsResponse = null;
+				}
+			}
+			else{
+				calcTotalsResponse = null;
+			}
+		
+		}catch (Exception e) {
+			logMessage("Exception: in calling Micros9700Webservice CalculateTotals for Kisok");
+			e.printStackTrace();
+			return null;
+		}
+		
+		return calcTotalsResponse;
+	}
+	
+	
+	private String getInterfaceVersion(int restId){
+		//Map<String,Map> allPosSettings = RestaurantIntegrationFactory.posSettingsDictionary;
+		Map<String,Map> allPosSettings = Micros9700IntegrationImplMap.getPosSettingsDictionary();
+		Map intfcVerMap = allPosSettings.get("restaurant-integration.micros9700.interface-version");
+		String intrfcVer = intfcVerMap.get((Integer)restId).toString();
+		return intrfcVer;
+	}
+
+	private String getDataAccessInterfaceVersion(int restId){
+		Map<String,Map> allPosSettings = Micros9700IntegrationImplMap.getPosSettingsDictionary();
+		Map intfcVerMap = allPosSettings.get("restaurant-integration.micros9700.data-access-interface-version");
+		String intrfcVer = intfcVerMap.get((Integer)restId).toString();
+		return intrfcVer;
+	}
+	
+	private String getClientName(int restId){
+		Map<String,Map> allPosSettings = Micros9700IntegrationImplMap.getPosSettingsDictionary();
+		Map clientMap = allPosSettings.get("restaurant-integration.micros9700.client-name");
+		String client = clientMap.get((Integer)restId).toString();
+		return client;
+	}
+	
+	private String getServURL(int restId){
+		Map<String,Map> allPosSettings = Micros9700IntegrationImplMap.getPosSettingsDictionary();
+		Map urlMap = allPosSettings.get("restaurant-integration.micros9700.serviceurl");
+		String url = urlMap.get((Integer)restId).toString();
+		return url;
+	}
+	
+	private String getServDownloadsURL(int restId){
+		Map<String,Map> allPosSettings = Micros9700IntegrationImplMap.getPosSettingsDictionary();
+		Map urlDownloadsMap = allPosSettings.get("restaurant-integration.micros9700.downloads-serviceurl");
+		String urlDownloads = urlDownloadsMap.get((Integer)restId).toString();
+		return urlDownloads;
+	}
+	
+	private String getMicros9700KioskCashTenderMedia(int restId){
+		Map<String,Map> allPosSettings = Micros9700IntegrationImplMap.getPosSettingsDictionary();
+		Map kioskTMMap = allPosSettings.get("restaurant-integration.micros9700.kiosk-tender-media");
+		String tm = kioskTMMap.get((Integer)restId).toString();
+		return tm;
+	}
+	  
+	private String getMicros9700KioskCurrNum(int restId){
+		Map<String,Map> allPosSettings = Micros9700IntegrationImplMap.getPosSettingsDictionary();
+		Map kioskCurrMap = allPosSettings.get("restaurant-integration.micros9700.kiosk-curr-num");
+		String curr = kioskCurrMap.get((Integer)restId).toString();
+		return curr;
+	}
+	
+	private String getMicros9700OrderType(int restId){
+		Map<String,Map> allPosSettings = Micros9700IntegrationImplMap.getPosSettingsDictionary();
+		Map ordTypeMap = allPosSettings.get("restaurant-integration.micros9700.order-type");
+		String ordType = ordTypeMap.get((Integer)restId).toString();
+		return ordType;
+	}
+	
+	public Boolean getPostOrderAtStartTxn(int restId){
+		Map<String,Map> allPosSettings = Micros9700IntegrationImplMap.getPosSettingsDictionary();
+		Map postOrdAtStartTxnMap = allPosSettings.get("restaurant-integration.post-order.at-start-transaction");
+		String postOrdAtStartTxn = postOrdAtStartTxnMap.get((Integer)restId).toString();
+		Boolean postOrdAtStartTxnBool = Boolean.parseBoolean(postOrdAtStartTxn);
+		return postOrdAtStartTxnBool;
+	}
+	
+	private String getDummyItemPOSID(int restId){
+		Map<String,Map> allPosSettings = Micros9700IntegrationImplMap.getPosSettingsDictionary();
+		Map dummyPOSItemIDMap = allPosSettings.get("restaurant-integration.dummy-item.posid");
+		String dummyPOSItemID = dummyPOSItemIDMap.get((Integer)restId).toString();
+		return dummyPOSItemID;
+	}
+	
+	public List<Integer> getSupportedResturants() {
+		return supportedResturants;
+	}
+
+	public void setSupportedResturants(List<Integer> supportedResturants) {
+		this.supportedResturants = supportedResturants;
+	}
+	
+	public String getClientIdForThis() {
+		return clientIdForThis;
+	}
+
+	public void setClientIdForThis(String clientIdForThis) {
+		this.clientIdForThis = clientIdForThis;
+	}
+	
+	/*public static void main(String [] a) throws RestaurantIntegrationAPIException{
+		ShawmanIntegrationImpl obj=new ShawmanIntegrationImpl();
+		
+		POSMenuItemInfo posMenuItem = new POSMenuItemInfo();
+		List<POSMenuItemInfo> menuItems = new ArrayList<POSMenuItemInfo>();
+		menuItems.add(posMenuItem);
+		
+		posMenuItem.setItemKey(1);
+		posMenuItem.setPosID("137");
+		posMenuItem.setName("abc");
+		posMenuItem.setQuantity(1.0f);
+		posMenuItem.setPrice(1.02f);
+		posMenuItem.setSubType("a");
+		posMenuItem.setCourseOrder(1);
+
+		ArrayList<POSModifierValueInfo> posModifierValues = new ArrayList<POSModifierValueInfo>();
+		posMenuItem.setModifierValues(posModifierValues);
+		try {
+				
+				POSModifierValueInfo modifierValue = new POSModifierValueInfo();
+					modifierValue.setName("mno");
+					modifierValue.setValue("xyz");
+					modifierValue.setPosID("0");
+					modifierValue.setModifierPrice(0.02f);
+				
+				posModifierValues.add(modifierValue);
